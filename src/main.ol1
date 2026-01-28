@@ -1,0 +1,310 @@
+use clap::Parser;
+use num_bigint::BigUint;
+use num_traits::{One, Zero};
+use std::collections::HashMap;
+
+#[derive(Clone, Debug)]
+struct PosInfo {
+    n: u32,
+    k: u32,
+    entropy: f64, // k/n (only meaningful for n>0; we avoid n=0 anyway because k>=1)
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "Singmaster exploration lab (collisions + degree patterns + q=2 deformation test)")]
+struct Args {
+    /// Max n to scan (inclusive).
+    #[arg(long, default_value_t = 300)]
+    n_max: u32,
+
+    /// If set, only keep k <= n/2 (removes trivial symmetry k <-> n-k).
+    #[arg(long, default_value_t = true)]
+    half_triangle: bool,
+
+    /// Minimum multiplicity to treat as a collision.
+    #[arg(long, default_value_t = 3)]
+    min_mult: usize,
+
+    /// How many collision values to print in detail.
+    #[arg(long, default_value_t = 50)]
+    collision_print_limit: usize,
+
+    /// If set, ignore k=1 terms too (in addition to always ignoring k=0).
+    #[arg(long, default_value_t = false)]
+    ignore_k1: bool,
+
+    /// Also print a summary grouped by degree-pattern (k-multiset).
+    #[arg(long, default_value_t = true)]
+    print_degree_pattern_summary: bool,
+
+    /// In the per-collision printout, also print the q=2 values (not just survive/fail).
+    #[arg(long, default_value_t = true)]
+    print_q2_values: bool,
+}
+
+/// Exact binomial coefficient C(n,k) as BigUint (q=1 world).
+fn binom_big(n: u32, k: u32) -> BigUint {
+    if k > n {
+        return BigUint::zero();
+    }
+    if k == 0 || k == n {
+        return BigUint::one();
+    }
+    let k = k.min(n - k);
+    let mut num = BigUint::one();
+    let mut den = BigUint::one();
+
+    for i in 1..=k {
+        let a = BigUint::from((n - k + i) as u64);
+        let b = BigUint::from(i as u64);
+        num *= a;
+        den *= b;
+
+        let g = gcd_big(&num, &den);
+        if g > BigUint::one() {
+            num /= &g;
+            den /= &g;
+        }
+    }
+
+    if den != BigUint::one() {
+        num / den
+    } else {
+        num
+    }
+}
+
+/// Gaussian binomial evaluated at integer q >= 2:
+///   [n choose k]_q = Π_{i=0..k-1} (q^(n-i)-1)/(q^(k-i)-1)
+///
+/// Returns exact BigUint.
+fn gauss_binom_eval(n: u32, k: u32, q: u32) -> BigUint {
+    if k > n {
+        return BigUint::zero();
+    }
+    if k == 0 || k == n {
+        return BigUint::one();
+    }
+    assert!(q >= 2, "gauss_binom_eval expects q >= 2");
+
+    let k = k.min(n - k);
+
+    let q_big = BigUint::from(q as u64);
+
+    // We'll maintain a rational product via numerator/denominator with gcd reductions.
+    let mut num = BigUint::one();
+    let mut den = BigUint::one();
+
+    // Product over t = 1..k:
+    // numerator factor: q^(n-k+t) - 1
+    // denominator factor: q^t - 1
+    for t in 1..=k {
+        let exp_num = n - k + t;
+        let exp_den = t;
+
+        let mut a = q_big.pow(exp_num); // q^(exp_num)
+        let mut b = q_big.pow(exp_den); // q^(exp_den)
+
+        // a = q^(exp_num) - 1
+        // b = q^(exp_den) - 1
+        a -= BigUint::one();
+        b -= BigUint::one();
+
+        // Reduce cross-wise by gcds to keep numbers smaller:
+        // gcd(a, den), gcd(b, num), and gcd(a, b) where useful.
+        let g1 = gcd_big(&a, &den);
+        if g1 > BigUint::one() {
+            a /= &g1;
+            den /= &g1;
+        }
+
+        let g2 = gcd_big(&b, &num);
+        if g2 > BigUint::one() {
+            b /= &g2;
+            num /= &g2;
+        }
+
+        let g3 = gcd_big(&a, &b);
+        if g3 > BigUint::one() {
+            a /= &g3;
+            b /= &g3;
+        }
+
+        num *= a;
+        den *= b;
+
+        let g = gcd_big(&num, &den);
+        if g > BigUint::one() {
+            num /= &g;
+            den /= &g;
+        }
+    }
+
+    // Should be exact integer.
+    if den != BigUint::one() {
+        num / den
+    } else {
+        num
+    }
+}
+
+fn gcd_big(a: &BigUint, b: &BigUint) -> BigUint {
+    let mut x = a.clone();
+    let mut y = b.clone();
+    while !y.is_zero() {
+        let r = &x % &y;
+        x = y;
+        y = r;
+    }
+    x
+}
+
+/// Helper: build sorted degree-pattern key like "2,3,5".
+fn degree_pattern_key(mut ks: Vec<u32>) -> String {
+    ks.sort_unstable();
+    let mut out = String::new();
+    for (i, k) in ks.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&k.to_string());
+    }
+    out
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // q=1 value -> list of positions
+    let mut hits: HashMap<BigUint, Vec<PosInfo>> = HashMap::new();
+
+    for n in 0..=args.n_max {
+        // Always ignore k=0, so start from 1.
+        let k_max = if args.half_triangle { n / 2 } else { n };
+        if k_max < 1 {
+            continue;
+        }
+
+        for k in 1..=k_max {
+            if args.ignore_k1 && k == 1 {
+                continue;
+            }
+
+            // Entropy ratio k/n, n>0 here always because k>=1 implies n>=1.
+            let entropy = (k as f64) / (n as f64);
+
+            let v = binom_big(n, k);
+            hits.entry(v).or_default().push(PosInfo { n, k, entropy });
+        }
+    }
+
+    println!(
+        "Scanned n=0..={} (half_triangle={}, ignore_k1={}, ignore_k0=always), unique values={}",
+        args.n_max, args.half_triangle, args.ignore_k1, hits.len()
+    );
+
+    // Extract collisions (multiplicity >= min_mult)
+    let mut collisions: Vec<(BigUint, Vec<PosInfo>)> = hits
+        .into_iter()
+        .filter(|(_, pos)| pos.len() >= args.min_mult)
+        .collect();
+
+    // Sort collisions by multiplicity desc, then by bit-size asc, then by numeric.
+    collisions.sort_by(|(va, pa), (vb, pb)| {
+        pb.len()
+            .cmp(&pa.len())
+            .then_with(|| va.bits().cmp(&vb.bits()))
+            .then_with(|| va.cmp(vb))
+    });
+
+    println!(
+        "Collision values with mult >= {}: {}",
+        args.min_mult,
+        collisions.len()
+    );
+
+    // Group collisions by degree-pattern
+    let mut pattern_groups: HashMap<String, Vec<BigUint>> = HashMap::new();
+
+    println!("\nDetailed collisions (showing up to {}):", args.collision_print_limit);
+
+    let mut shown = 0usize;
+    for (value, mut pos) in collisions.iter().cloned() {
+        // Sort positions for readability
+        pos.sort_by(|a, b| (a.n, a.k).cmp(&(b.n, b.k)));
+
+        // Degrees pattern
+        let ks: Vec<u32> = pos.iter().map(|p| p.k).collect();
+        let pat = degree_pattern_key(ks.clone());
+        pattern_groups.entry(pat.clone()).or_default().push(value.clone());
+
+        // q=2 deformation test: do these positions still collide under Gaussian binomial?
+        let q = 2u32;
+        let mut q2_vals: Vec<BigUint> = Vec::with_capacity(pos.len());
+        for p in &pos {
+            let g = gauss_binom_eval(p.n, p.k, q);
+            q2_vals.push(g);
+        }
+        let survives_q2 = q2_vals
+            .first()
+            .map(|first| q2_vals.iter().all(|x| x == first))
+            .unwrap_or(false);
+
+        shown += 1;
+        if shown <= args.collision_print_limit {
+            println!(
+                "\nvalue={}  mult={}  bits={}  degree_pattern=[{}]  survives_at_q2={}",
+                value,
+                pos.len(),
+                value.bits(),
+                pat,
+                survives_q2
+            );
+
+            print!("  positions:");
+            for p in &pos {
+                print!(" ({},{})", p.n, p.k);
+            }
+            println!();
+
+            print!("  entropy(k/n):");
+            for p in &pos {
+                print!(" {:.6}", p.entropy);
+            }
+            println!();
+
+            if args.print_q2_values {
+                print!("  q=2 values:");
+                for v2 in &q2_vals {
+                    print!(" {}", v2);
+                }
+                println!();
+            }
+        } else {
+            break;
+        }
+    }
+
+    if args.print_degree_pattern_summary {
+        // Sort patterns by number of collision-values descending, then lexicographically.
+        let mut pats: Vec<(String, Vec<BigUint>)> = pattern_groups.into_iter().collect();
+        pats.sort_by(|(pa, va), (pb, vb)| vb.len().cmp(&va.len()).then_with(|| pa.cmp(pb)));
+
+        println!("\nDegree-pattern summary (pattern -> how many collision-values share it):");
+        for (pat, mut values) in pats {
+            values.sort();
+            println!(
+                "  pattern=[{}]  collision_values_count={}  smallest_value={}  largest_value={}",
+                pat,
+                values.len(),
+                values.first().unwrap(),
+                values.last().unwrap()
+            );
+        }
+    }
+
+    println!("\nNotes:");
+    println!("  - k=0 is always ignored (removes the huge 'value=1' noise).");
+    println!("  - Use --ignore-k1 to also remove the edge family C(n,1)=n (linear noise).");
+    println!("  - survives_at_q2=true means the SAME set of positions also collide under Gaussian binomials at q=2.");
+}
