@@ -1,468 +1,394 @@
+//! singmaster_lab — search utilities for binomial coefficient collisions (Singmaster-style exploration).
+//!
+//! This program scans positions (n,k) with n<=N_MAX and k<=K_MAX, applies optional geometric
+//! filters, and groups positions by equal binomial coefficient C(n,k). It can also compute
+//! the Gaussian (q-binomial) coefficient at q=2 as an auxiliary signal.
+//!
+//! Key CLI ergonomics:
+//!   - `--half-triangle` (default) / `--no-half-triangle`
+//!   - `--print-q2-values` (default) / `--no-print-q2-values`
+//!   - `--q2-only` / `--no-q2-only` (default is off)
+//!
+//! Notes:
+//!   - If you disable half-triangle, you will see lots of trivial symmetry pairs
+//!     (n,k) and (n,n-k). That's expected.
+
+use std::collections::{BTreeMap, HashMap};
+
 use clap::{ArgAction, Parser};
 use num_bigint::BigUint;
-use num_traits::{One, Zero};
-use std::collections::HashMap;
+use num_traits::One;
 
-#[derive(Clone, Debug)]
-struct PosInfo {
-    n: u32,
-    k: u32,
-    entropy: f64, // k/n
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Singmaster lab: two-pass fingerprint scan + prime-exponent exact verification + q=2 deformation filter"
-)]
+/// Search for collisions in binomial coefficients (and optionally inspect q=2 gaussian values).
+#[derive(Parser, Debug, Clone)]
+#[command(name = "singmaster_lab", version, about)]
 struct Args {
-    /// Max n to scan (inclusive).
-    #[arg(long, default_value_t = 1000)]
+    /// Maximum n to scan (inclusive).
+    #[arg(long)]
     n_max: u32,
 
-    /// Only keep k <= n/2 (removes trivial symmetry k <-> n-k).
-    #[arg(long, default_value_t = true)]
+    /// Maximum k to scan (inclusive).
+    #[arg(long)]
+    k_max: u32,
+
+    /// Limit to half of Pascal's triangle (k <= n/2).
+    ///
+    /// Default is enabled. Use `--no-half-triangle` to disable.
+    #[arg(long = "half-triangle", action = ArgAction::SetTrue)]
     half_triangle: bool,
 
-    /// k=0 is always ignored. k=1 is ignored by default; pass --keep-k1 to include it.
-    #[arg(long, default_value_t = false)]
+    /// Disable half-triangle restriction (include both sides).
+    #[arg(long = "no-half-triangle", action = ArgAction::SetTrue)]
+    no_half_triangle: bool,
+
+    /// Keep k=1 and k=n-1 entries (normally skipped because they create many trivial repeats).
+    #[arg(long, action = ArgAction::SetTrue)]
     keep_k1: bool,
 
-    /// Minimum multiplicity (2 = pair collisions, 3 = triple collisions, ...).
+    /// Optional diagonal band around the central diagonal k ~= n/2, in k-units.
+    ///
+    /// If set to W, a position (n,k) is kept iff |2k - n| <= 2W.
+    #[arg(long)]
+    diag_band: Option<u32>,
+
+    /// Minimum multiplicity to report (>=2 means collisions).
     #[arg(long, default_value_t = 2)]
     min_mult: usize,
 
-    /// Only print collisions that ALSO collide at q=2 (Gaussian binomials).
-    /// Use --no-q2-only to disable.
-    #[arg(long, action = ArgAction::SetTrue, default_value_t = true)]
-    #[arg(long = "no-q2-only", action = ArgAction::SetFalse)]
+    /// Only keep collision groups that also contain a q=2 gaussian collision internally.
+    ///
+    /// (i.e. within an equal-binomial group, at least `min_mult` positions share the same
+    /// q=2 gaussian value).
+    #[arg(long = "q2-only", action = ArgAction::SetTrue)]
     q2_only: bool,
 
-    /// Maximum k to scan (caps width; keeps laptops alive).
-    #[arg(long, default_value_t = 64)]
-    k_max: u32,
+    /// Explicitly disable q2-only mode (default is off anyway).
+    #[arg(long = "no-q2-only", action = ArgAction::SetTrue)]
+    no_q2_only: bool,
 
-    /// How many collision values to print in detail.
-    #[arg(long, default_value_t = 80)]
-    collision_print_limit: usize,
-
-    /// Also print a summary grouped by degree-pattern (k-multiset).
-    #[arg(long, default_value_t = true)]
-    print_degree_pattern_summary: bool,
-
-    /// Print q=2 values for the positions.
-    /// Use --no-print-q2-values to disable.
-    #[arg(long, action = ArgAction::SetTrue, default_value_t = true)]
-    #[arg(long = "no-print-q2-values", action = ArgAction::SetFalse)]
+    /// Print q=2 gaussian values for each reported position.
+    ///
+    /// Default is enabled. Use `--no-print-q2-values` to disable.
+    #[arg(long = "print-q2-values", action = ArgAction::SetTrue)]
     print_q2_values: bool,
+
+    /// Disable printing q=2 gaussian values.
+    #[arg(long = "no-print-q2-values", action = ArgAction::SetTrue)]
+    no_print_q2_values: bool,
+
+    /// Maximum number of collision groups to print (0 = no limit).
+    #[arg(long, default_value_t = 0)]
+    collision_print_limit: usize,
 }
 
-// Two distinct 64-bit primes < 2^64 for fast modular hashing.
-const P1: u64 = 18446744073709551557u64; // 2^64 - 59
-const P2: u64 = 18446744073709551533u64; // 2^64 - 83
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Fingerprint {
+    /// number of 32-bit limbs
+    len: u32,
+    lo0: u32,
+    lo1: u32,
+    hi0: u32,
+    hi1: u32,
+}
+
+fn fingerprint_biguint(x: &BigUint) -> Fingerprint {
+    let digits = x.to_u32_digits(); // little-endian limbs
+    let len = digits.len() as u32;
+    let lo0 = *digits.get(0).unwrap_or(&0);
+    let lo1 = *digits.get(1).unwrap_or(&0);
+    let hi0 = *digits.get(digits.len().wrapping_sub(1)).unwrap_or(&0);
+    let hi1 = *digits.get(digits.len().wrapping_sub(2)).unwrap_or(&0);
+    Fingerprint {
+        len,
+        lo0,
+        lo1,
+        hi0,
+        hi1,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Pos {
+    n: u32,
+    k: u32,
+}
+
+fn within_diag_band(n: u32, k: u32, band: Option<u32>) -> bool {
+    let Some(w) = band else { return true; };
+    let n_i = n as i64;
+    let k_i = k as i64;
+    let w_i = w as i64;
+    (2 * k_i - n_i).abs() <= 2 * w_i
+}
+
+fn effective_half_triangle(args: &Args) -> bool {
+    // Default is ON unless explicitly disabled.
+    if args.no_half_triangle {
+        false
+    } else if args.half_triangle {
+        true
+    } else {
+        true
+    }
+}
+
+fn effective_print_q2(args: &Args) -> bool {
+    // Default is ON unless explicitly disabled.
+    if args.no_print_q2_values {
+        false
+    } else if args.print_q2_values {
+        true
+    } else {
+        true
+    }
+}
+
+fn effective_q2_only(args: &Args) -> bool {
+    if args.no_q2_only {
+        false
+    } else if args.q2_only {
+        true
+    } else {
+        false
+    }
+}
+
+fn include_pos(half_triangle: bool, args: &Args, n: u32, k: u32) -> bool {
+    if k > args.k_max || k > n {
+        return false;
+    }
+
+    // Always skip the boundary values: C(n,0)=C(n,n)=1 (huge trivial "collision group").
+    if k == 0 || k == n {
+        return false;
+    }
+
+    if half_triangle && k > n / 2 {
+        return false;
+    }
+
+    if !args.keep_k1 {
+        if k == 1 || (n >= 1 && k == n - 1) {
+            return false;
+        }
+    }
+
+    if !within_diag_band(n, k, args.diag_band) {
+        return false;
+    }
+
+    true
+}
+
+/// Binomial coefficient C(n,k) computed via multiplicative method (exact).
+fn binom(n: u32, k: u32) -> BigUint {
+    if k == 0 || k == n {
+        return BigUint::one();
+    }
+    let k_eff = k.min(n - k);
+    let mut acc = BigUint::one();
+    for i in 1..=k_eff {
+        acc *= BigUint::from(n - k_eff + i);
+        acc /= BigUint::from(i);
+    }
+    acc
+}
+
+/// Gaussian binomial coefficient [n k]_q for q=2, computed across k for a fixed n.
+///
+/// Recurrence:
+/// [n 0]_2 = 1
+/// [n k]_2 = [n k-1]_2 * (2^(n-k+1)-1) / (2^k - 1)
+fn gaussian_q2_row(n: u32, k_max: u32) -> Vec<BigUint> {
+    let mut row: Vec<BigUint> = Vec::with_capacity((k_max + 1) as usize);
+    row.push(BigUint::one()); // k=0
+    let mut cur = BigUint::one();
+
+    for k in 1..=k_max {
+        let num_exp = n - k + 1;
+        let denom_exp = k;
+
+        let numerator = (BigUint::one() << num_exp) - BigUint::one();
+        let denominator = (BigUint::one() << denom_exp) - BigUint::one();
+
+        cur *= numerator;
+        cur /= denominator; // exact
+        row.push(cur.clone());
+    }
+    row
+}
+
+fn degree_pattern_key(ks_sorted: &[u32]) -> String {
+    if ks_sorted.is_empty() {
+        return "(empty)".to_string();
+    }
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < ks_sorted.len() {
+        let v = ks_sorted[i];
+        let mut j = i + 1;
+        while j < ks_sorted.len() && ks_sorted[j] == v {
+            j += 1;
+        }
+        let cnt = j - i;
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("{v}^{cnt}"));
+        i = j;
+    }
+    out
+}
 
 fn main() {
     let args = Args::parse();
 
-    // We always ignore k=0; ignore k=1 unless keep_k1.
-    let k_start: u32 = if args.keep_k1 { 1 } else { 2 };
+    let half_triangle = effective_half_triangle(&args);
+    let print_q2_values = effective_print_q2(&args);
+    let q2_only = effective_q2_only(&args);
 
-    if args.k_max < k_start {
-        eprintln!(
-            "k_max={} is < k_start={} (keep_k1={}). Nothing to scan.",
-            args.k_max, k_start, args.keep_k1
-        );
-        return;
-    }
-
-    // -------------------------
-    // PASS 1: Fingerprint scan
-    // -------------------------
-    let inv1 = precompute_inverses(P1, args.k_max);
-    let inv2 = precompute_inverses(P2, args.k_max);
-
-    // fingerprint(u128) -> positions
-    let mut fp_hits: HashMap<u128, Vec<PosInfo>> = HashMap::new();
-
-    let mut positions_scanned: u64 = 0;
-    for n in 0..=args.n_max {
-        let mut k_lim = if args.half_triangle { n / 2 } else { n };
-        if k_lim > args.k_max {
-            k_lim = args.k_max;
-        }
-        if k_lim < k_start {
-            continue;
-        }
-
-        for k in k_start..=k_lim {
-            let fp = fingerprint_binom_mod(n, k, &inv1, &inv2);
-            // n>=1 here because k>=1
-            let entropy = (k as f64) / (n as f64);
-            fp_hits
-                .entry(fp)
-                .or_default()
-                .push(PosInfo { n, k, entropy });
-            positions_scanned += 1;
-        }
-    }
-
-    let mut candidates: Vec<(u128, Vec<PosInfo>)> = fp_hits
-        .into_iter()
-        .filter(|(_, pos)| pos.len() >= args.min_mult)
-        .collect();
-
-    candidates.sort_by(|(_, a), (_, b)| b.len().cmp(&a.len()));
-
-    println!(
-        "PASS1: scanned n=0..={} (half_triangle={}, keep_k1={}, k_max={}), positions_scanned={}, fp_buckets_with_count>=min_mult({})={}",
+    eprintln!(
+        "scan: n<= {}  k<= {}  half_triangle={}  diag_band={:?}  keep_k1={}  min_mult={}  q2_only={}  print_q2_values={}",
         args.n_max,
-        args.half_triangle,
-        args.keep_k1,
         args.k_max,
-        positions_scanned,
+        half_triangle,
+        args.diag_band,
+        args.keep_k1,
         args.min_mult,
-        candidates.len()
+        q2_only,
+        print_q2_values
     );
 
-    if candidates.is_empty() {
-        println!("No fingerprint buckets reached multiplicity >= {}. Done.", args.min_mult);
-        return;
-    }
+    let t0 = std::time::Instant::now();
 
-    // -------------------------
-    // PASS 2: Exact verification
-    // -------------------------
-    let primes = sieve_primes(args.n_max);
+    // PASS 1: fingerprint bucketization to find likely collisions without storing huge BigUints as keys.
+    let mut buckets: HashMap<Fingerprint, Vec<Pos>> = HashMap::new();
 
-    let mut exact_hits: HashMap<BigUint, Vec<PosInfo>> = HashMap::new();
-    let mut exact_positions_verified: u64 = 0;
-
-    for (_fp, positions) in candidates {
-        for p in positions {
-            let v = binom_big_prime_exponent(p.n, p.k, &primes);
-            exact_hits.entry(v).or_default().push(p);
-            exact_positions_verified += 1;
+    for n in 0..=args.n_max {
+        let k_lim = args.k_max.min(n);
+        for k in 0..=k_lim {
+            if !include_pos(half_triangle, &args, n, k) {
+                continue;
+            }
+            let v = binom(n, k);
+            let fp = fingerprint_biguint(&v);
+            buckets.entry(fp).or_default().push(Pos { n, k });
         }
     }
 
-    let mut collisions: Vec<(BigUint, Vec<PosInfo>)> = exact_hits
-        .into_iter()
-        .filter(|(_, pos)| pos.len() >= args.min_mult)
-        .collect();
+    buckets.retain(|_, v| v.len() >= args.min_mult);
 
-    collisions.sort_by(|(va, pa), (vb, pb)| {
-        pb.len()
-            .cmp(&pa.len())
-            .then_with(|| va.bits().cmp(&vb.bits()))
-            .then_with(|| va.cmp(vb))
+    eprintln!(
+        "pass1: candidate buckets={}  elapsed={:.2}s",
+        buckets.len(),
+        t0.elapsed().as_secs_f64()
+    );
+
+    // Flatten candidates.
+    let mut candidates: Vec<Pos> = Vec::new();
+    for v in buckets.values() {
+        candidates.extend_from_slice(v);
+    }
+
+    // PASS 2: exact grouping by true BigUint value, but only for candidates.
+    let mut exact: HashMap<BigUint, Vec<Pos>> = HashMap::new();
+    for pos in &candidates {
+        let v = binom(pos.n, pos.k);
+        exact.entry(v).or_default().push(*pos);
+    }
+    exact.retain(|_, v| v.len() >= args.min_mult);
+
+    eprintln!(
+        "pass2: exact collision groups={}  elapsed={:.2}s",
+        exact.len(),
+        t0.elapsed().as_secs_f64()
+    );
+
+    // Optional q2-only filter: inside each binomial-collision group, check whether q=2 gaussian values collide.
+    let mut kept_groups: Vec<Vec<Pos>> = Vec::new();
+
+    for (_key, mut positions) in exact {
+        positions.sort_by_key(|p| (p.n, p.k));
+
+        if q2_only {
+            let mut q2_counts: HashMap<Fingerprint, usize> = HashMap::new();
+            for p in &positions {
+                let row = gaussian_q2_row(p.n, p.k);
+                let q2v = &row[p.k as usize];
+                *q2_counts.entry(fingerprint_biguint(q2v)).or_insert(0) += 1;
+            }
+            let survives = q2_counts.values().any(|&c| c >= args.min_mult);
+            if !survives {
+                continue;
+            }
+        }
+
+        kept_groups.push(positions);
+    }
+
+    eprintln!(
+        "q2-filter: kept={}  elapsed={:.2}s",
+        kept_groups.len(),
+        t0.elapsed().as_secs_f64()
+    );
+
+    // Sort by multiplicity descending, then by first (n,k) for determinism.
+    kept_groups.sort_by(|a, b| {
+        b.len()
+            .cmp(&a.len())
+            .then_with(|| a[0].n.cmp(&b[0].n))
+            .then_with(|| a[0].k.cmp(&b[0].k))
     });
 
-    println!(
-        "PASS2: verified_positions={}, exact_collision_values_with_mult>={}={}",
-        exact_positions_verified,
-        args.min_mult,
-        collisions.len()
-    );
+    let mut pattern_summary: BTreeMap<String, Vec<Vec<Pos>>> = BTreeMap::new();
 
-    // Pattern groups (only for what we actually print)
-    let mut pattern_groups: HashMap<String, Vec<BigUint>> = HashMap::new();
+    let mut printed_groups = 0usize;
+    for positions in &kept_groups {
+        let mult = positions.len();
 
-    println!(
-        "\nDetailed collisions (q2_only={}, showing up to {}):",
-        args.q2_only, args.collision_print_limit
-    );
+        // Pattern summary uses the multiset of k values for the group.
+        let mut ks: Vec<u32> = positions.iter().map(|p| p.k).collect();
+        ks.sort_unstable();
+        let pat = degree_pattern_key(&ks);
+        pattern_summary.entry(pat).or_default().push(positions.clone());
 
-    let mut shown = 0usize;
-    for (value, mut pos) in collisions.iter().cloned() {
-        pos.sort_by(|a, b| (a.n, a.k).cmp(&(b.n, b.k)));
-
-        let pat = degree_pattern_key(pos.iter().map(|p| p.k).collect::<Vec<_>>());
-
-        // q=2 deformation test
-        let q = 2u32;
-        let mut q2_vals: Vec<BigUint> = Vec::with_capacity(pos.len());
-        for p in &pos {
-            q2_vals.push(gauss_binom_eval(p.n, p.k, q));
-        }
-        let survives_q2 = q2_vals
-            .first()
-            .map(|first| q2_vals.iter().all(|x| x == first))
-            .unwrap_or(false);
-
-        // Apply q2-only filter
-        if args.q2_only && !survives_q2 {
+        if args.collision_print_limit != 0 && printed_groups >= args.collision_print_limit {
             continue;
         }
 
-        pattern_groups.entry(pat.clone()).or_default().push(value.clone());
+        println!("== Collision (mult={}) ==", mult);
+        let pos_list: Vec<(u32, u32)> = positions.iter().map(|p| (p.n, p.k)).collect();
+        println!("positions: {:?}", pos_list);
 
-        shown += 1;
-        if shown > args.collision_print_limit {
-            break;
-        }
-
-        println!(
-            "\nvalue={}  mult={}  bits={}  degree_pattern=[{}]  survives_at_q2={}",
-            value,
-            pos.len(),
-            value.bits(),
-            pat,
-            survives_q2
-        );
-
-        print!("  positions:");
-        for p in &pos {
-            print!(" ({},{})", p.n, p.k);
-        }
-        println!();
-
-        print!("  entropy(k/n):");
-        for p in &pos {
-            print!(" {:.6}", p.entropy);
-        }
-        println!();
-
-        if args.print_q2_values {
-            print!("  q=2 values:");
-            for v2 in &q2_vals {
-                print!(" {}", v2);
+        if print_q2_values {
+            println!("q=2 values:");
+            for p in positions {
+                let row = gaussian_q2_row(p.n, p.k);
+                let q2v = &row[p.k as usize];
+                println!("  [{},{}]  {}", p.n, p.k, q2v);
             }
             println!();
         }
+
+        printed_groups += 1;
     }
 
-    if shown == 0 {
-        println!("(none printed) — either no collisions met mult>=min_mult, or q2_only filtered them all out.");
-    }
-
-    if args.print_degree_pattern_summary {
-        let mut pats: Vec<(String, Vec<BigUint>)> = pattern_groups.into_iter().collect();
-        pats.sort_by(|(pa, va), (pb, vb)| vb.len().cmp(&va.len()).then_with(|| pa.cmp(pb)));
-
-        println!("\nDegree-pattern summary (pattern -> how many collision-values share it):");
-        for (pat, mut values) in pats {
-            values.sort();
-            println!(
-                "  pattern=[{}]  collision_values_count={}  smallest_value={}  largest_value={}",
-                pat,
-                values.len(),
-                values.first().unwrap(),
-                values.last().unwrap()
-            );
-        }
-    }
-
-    println!("\nNotes:");
-    println!("  - k=0 is always ignored.");
-    println!("  - k=1 is ignored by default; pass --keep-k1 to include it.");
-    println!("  - PASS1 uses (C(n,k) mod P1, C(n,k) mod P2) fingerprints to cheaply find candidates.");
-    println!("  - PASS2 verifies candidates exactly via prime-exponent (Legendre) BigUint construction.");
-    println!("  - Use --no-q2-only to print all q=1 collisions (including those that do not survive at q=2).");
-    println!("  - Use --no-print-q2-values to suppress large q=2 numbers in output.");
-}
-
-// --------------------------
-// PASS1: fingerprint helpers
-// --------------------------
-
-fn precompute_inverses(p: u64, k_max: u32) -> Vec<u64> {
-    // inv[0] unused; inv[1]=1; inv[i] = p - (p/i) * inv[p%i] mod p for prime p.
-    let km = k_max as usize;
-    let mut inv = vec![0u64; km + 1];
-    if km >= 1 {
-        inv[1] = 1;
-    }
-    for i in 2..=km {
-        let i_u64 = i as u64;
-        let q = p / i_u64;
-        let r = (p % i_u64) as usize;
-        let prod = mul_mod_u64(q % p, inv[r], p);
-        inv[i] = if prod == 0 { 0 } else { p - prod };
-    }
-    inv
-}
-
-fn fingerprint_binom_mod(n: u32, k: u32, inv1: &[u64], inv2: &[u64]) -> u128 {
-    let r1 = binom_mod_prime(n, k, P1, inv1);
-    let r2 = binom_mod_prime(n, k, P2, inv2);
-    ((r1 as u128) << 64) | (r2 as u128)
-}
-
-fn binom_mod_prime(n: u32, k: u32, p: u64, inv: &[u64]) -> u64 {
-    if k > n {
-        return 0;
-    }
-    if k == 0 || k == n {
-        return 1;
-    }
-    let k = k.min(n - k);
-    let mut acc: u64 = 1;
-    for i in 1..=k {
-        let num = (n - k + i) as u64 % p;
-        acc = mul_mod_u64(acc, num, p);
-        acc = mul_mod_u64(acc, inv[i as usize], p);
-    }
-    acc
-}
-
-#[inline]
-fn mul_mod_u64(a: u64, b: u64, m: u64) -> u64 {
-    ((a as u128 * b as u128) % (m as u128)) as u64
-}
-
-// -------------------------------------
-// PASS2: prime-exponent exact binomials
-// -------------------------------------
-
-fn sieve_primes(n_max: u32) -> Vec<u32> {
-    if n_max < 2 {
-        return vec![];
-    }
-    let n = n_max as usize;
-    let mut is_prime = vec![true; n + 1];
-    is_prime[0] = false;
-    is_prime[1] = false;
-
-    let mut p = 2usize;
-    while p * p <= n {
-        if is_prime[p] {
-            let mut j = p * p;
-            while j <= n {
-                is_prime[j] = false;
-                j += p;
+    println!("=== Degree-pattern summary ===");
+    for (pat, groups) in &pattern_summary {
+        println!("pattern {}  count={}", pat, groups.len());
+        let mut shown = 0usize;
+        for g in groups {
+            let pos_list: Vec<(u32, u32)> = g.iter().map(|p| (p.n, p.k)).collect();
+            println!("  {:?}", pos_list);
+            shown += 1;
+            if shown >= 20 {
+                if groups.len() > shown {
+                    println!("  ... ({} more)", groups.len() - shown);
+                }
+                break;
             }
         }
-        p += 1;
     }
 
-    let mut primes = Vec::new();
-    for i in 2..=n {
-        if is_prime[i] {
-            primes.push(i as u32);
-        }
-    }
-    primes
-}
-
-fn v_p_factorial(mut n: u32, p: u32) -> u32 {
-    let mut acc: u32 = 0;
-    while n > 0 {
-        n /= p;
-        acc += n;
-    }
-    acc
-}
-
-fn binom_big_prime_exponent(n: u32, k: u32, primes: &[u32]) -> BigUint {
-    if k > n {
-        return BigUint::zero();
-    }
-    if k == 0 || k == n {
-        return BigUint::one();
-    }
-    let k = k.min(n - k);
-
-    let mut out = BigUint::one();
-    for &p in primes {
-        if p > n {
-            break;
-        }
-        let e = v_p_factorial(n, p) - v_p_factorial(k, p) - v_p_factorial(n - k, p);
-        if e > 0 {
-            out *= BigUint::from(p as u64).pow(e);
-        }
-    }
-    out
-}
-
-// ------------------------------------
-// q=2 evaluation (Gaussian binomials)
-// ------------------------------------
-
-fn gauss_binom_eval(n: u32, k: u32, q: u32) -> BigUint {
-    if k > n {
-        return BigUint::zero();
-    }
-    if k == 0 || k == n {
-        return BigUint::one();
-    }
-    assert!(q >= 2, "gauss_binom_eval expects q >= 2");
-
-    let k = k.min(n - k);
-    let q_big = BigUint::from(q as u64);
-
-    let mut num = BigUint::one();
-    let mut den = BigUint::one();
-
-    for t in 1..=k {
-        let exp_num = n - k + t;
-        let exp_den = t;
-
-        let mut a = q_big.pow(exp_num);
-        let mut b = q_big.pow(exp_den);
-
-        a -= BigUint::one();
-        b -= BigUint::one();
-
-        let g1 = gcd_big(&a, &den);
-        if g1 > BigUint::one() {
-            a /= &g1;
-            den /= &g1;
-        }
-
-        let g2 = gcd_big(&b, &num);
-        if g2 > BigUint::one() {
-            b /= &g2;
-            num /= &g2;
-        }
-
-        let g3 = gcd_big(&a, &b);
-        if g3 > BigUint::one() {
-            a /= &g3;
-            b /= &g3;
-        }
-
-        num *= a;
-        den *= b;
-
-        let g = gcd_big(&num, &den);
-        if g > BigUint::one() {
-            num /= &g;
-            den /= &g;
-        }
-    }
-
-    if den != BigUint::one() {
-        num / den
-    } else {
-        num
-    }
-}
-
-fn gcd_big(a: &BigUint, b: &BigUint) -> BigUint {
-    let mut x = a.clone();
-    let mut y = b.clone();
-    while !y.is_zero() {
-        let r = &x % &y;
-        x = y;
-        y = r;
-    }
-    x
-}
-
-// --------------------------
-// Reporting helper
-// --------------------------
-
-fn degree_pattern_key(mut ks: Vec<u32>) -> String {
-    ks.sort_unstable();
-    let mut out = String::new();
-    for (i, k) in ks.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push_str(&k.to_string());
-    }
-    out
+    println!("done. total elapsed={:.2}s", t0.elapsed().as_secs_f64());
 }
